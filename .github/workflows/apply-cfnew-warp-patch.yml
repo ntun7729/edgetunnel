@@ -1,0 +1,43 @@
+name: Apply native cfnew WARP patch
+
+permissions:
+  contents: write
+
+on:
+  push:
+    paths:
+      - '.github/workflows/apply-cfnew-warp-patch.yml'
+  workflow_dispatch:
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply targeted patch
+        run: node tools/apply_cfnew_warp_patch.mjs _worker_core.js
+
+      - name: Syntax and diff checks
+        run: |
+          node --check _worker_core.js
+          git diff --check
+          grep -q "const CFNEW官方直连地址" _worker_core.js
+          grep -q "firstByteTimeoutMs" _worker_core.js
+          grep -q "connecttoWARP" _worker_core.js
+
+      - name: Commit verified core directly to main
+        run: |
+          if git diff --quiet -- _worker_core.js; then
+            echo "No patch changes required"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add _worker_core.js
+          git commit -m "feat: add native cfnew-style WARP retry"
+          git push origin HEAD:main
