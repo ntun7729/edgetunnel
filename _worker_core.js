@@ -7,6 +7,44 @@ const WS早期数据最大字节 = 8 * 1024, WS早期数据最大头长度 = Mat
 const 上行合包目标字节 = 20 * 1024, 上行队列最大字节 = 16 * 1024 * 1024, 上行队列最大条目 = 4096;
 const 下行Grain包字节 = 32 * 1024, 下行Grain尾部阈值 = 512, 下行Grain低水位字节 = Math.max(4096, 下行Grain尾部阈值 * 12), 下行Grain最大等待轮次 = 4;
 let TCP并发拨号数 = 2, 反代并发拨号数 = 1, 预加载竞速拨号 = false;
+const CFNEW官方直连地址 = [
+	'172.71.218.190', '162.158.228.87', '162.158.189.134', '162.158.26.63', '162.158.25.86',
+	'162.158.29.216', '162.158.218.160', '162.158.227.214', '172.69.118.198', '172.69.119.150'
+];
+const WARP_TLS端口 = new Set([443, 2053, 2083, 2087, 2096, 8443]);
+const WARP默认首字节超时 = 1200;
+function WARP配置启用(value) {
+	if (value === undefined || value === null || String(value).trim() === '') return true;
+	return !/^(?:0|false|off|no|direct)$/i.test(String(value).trim());
+}
+function WARP种子哈希(seed) {
+	let hash = 2166136261 >>> 0;
+	for (const char of String(seed || 'CF')) {
+		hash ^= char.charCodeAt(0);
+		hash = Math.imul(hash, 16777619) >>> 0;
+	}
+	return hash >>> 0;
+}
+function 获取WARP候选地址(反代上下文 = {}) {
+	const fixed = String(反代上下文.WARP固定地址 || '').trim();
+	if (fixed && CFNEW官方直连地址.includes(fixed)) {
+		return [fixed, ...CFNEW官方直连地址.filter(ip => ip !== fixed)];
+	}
+	const start = WARP种子哈希(反代上下文.WARP种子 || 'CF') % CFNEW官方直连地址.length;
+	return CFNEW官方直连地址.map((_, i) => CFNEW官方直连地址[(start + i) % CFNEW官方直连地址.length]);
+}
+function 附加WARP配置(反代上下文, env = {}, request = null) {
+	const rawTimeout = Number(env.WARP_TIMEOUT ?? env.warp_timeout ?? WARP默认首字节超时);
+	const timeout = Number.isFinite(rawTimeout)
+		? Math.min(5000, Math.max(250, Math.round(rawTimeout)))
+		: WARP默认首字节超时;
+	const fixed = String(env.WARP_IP ?? env.warp_ip ?? '').trim();
+	反代上下文.WARP启用 = WARP配置启用(env.WARP ?? env.warp);
+	反代上下文.WARP首字节超时 = timeout;
+	反代上下文.WARP固定地址 = CFNEW官方直连地址.includes(fixed) ? fixed : '';
+	反代上下文.WARP种子 = String(request?.cf?.colo || 'CF');
+	return 反代上下文;
+}
 ///////////////////////////////////////////////////////查杀特征码///////////////////////////////////////////////
 const 特征码字典 = [
 	(Proxy.name + "IP").toUpperCase(),
@@ -65,11 +103,11 @@ export default {
 				if (请求前8总和 === 目标前8总和 && 请求UUID.slice(-12) === 目标UUID.slice(-12)) return new Response(JSON.stringify({ Version: Number(String(Version).replace(/\D+/g, '')) }), { status: 200, headers: { 'Content-Type': 'application/json;charset=utf-8' } });
 			}
 		} else if (管理员密码 && upgradeHeader === 'websocket') {// WebSocket代理
-			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
+			const 反代上下文 = 附加WARP配置(await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底), env, request);
 			log(`[WebSocket] 命中请求: ${url.pathname}${url.search}`);
 			return await 处理WS请求(request, userID, url, 反代上下文);
 		} else if (管理员密码 && !访问路径.startsWith('admin/') && 访问路径 !== 'login' && request.method === 'POST') {// gRPC/叉HTTP代理
-			const 反代上下文 = await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底);
+			const 反代上下文 = 附加WARP配置(await 反代参数获取(url, userID, 默认反代IP, 默认反代兜底), env, request);
 			const { 头: 本机Padding头, 键: 本机Padding键 } = 获取叉HTTPPadding标识(userID);
 			const 命中叉HTTP特征 = !!request.headers.get(本机Padding头) || !!url.searchParams.get(本机Padding键);
 			if (!命中叉HTTP特征 && contentType.startsWith('application/grpc')) {
@@ -2178,6 +2216,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	let 已通过代理发送首包 = false;
 	const TCP连接 = 创建请求TCP连接器(request);
 	const 使用木马反代 = 允许木马反代 && (反代上下文.木马反代地址 || null);
+	const ctxWARP首字节超时 = Number(反代上下文.WARP首字节超时) || WARP默认首字节超时;
+	const ctxWARP可用 = 反代上下文.WARP启用 !== false && ctx反代兜底 !== false && !ctx代理类型 && !使用木马反代 && WARP_TLS端口.has(Number(portNum));
 	const 木马反代目标 = 使用木马反代 ? 反代上下文.木马反代地址 : null;
 	const 木马反代握手数据 = 使用木马反代 ? 提取木马反代握手数据(木马反代首包数据, rawData) : null;
 	let 待发送响应头 = respHeader;
@@ -2188,7 +2228,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 	};
 	if (!Number.isInteger(remoteConnWrapper.generation)) remoteConnWrapper.generation = 0;
 
-	const 安装当前连接 = async (socket, generation, downlinkDrain, retryFunc = null) => {
+	const 安装当前连接 = async (socket, generation, downlinkDrain, retryFunc = null, firstByteTimeoutMs = 0) => {
 		try { await downlinkDrain } catch (e) {
 			if (remoteConnWrapper.downlinkDrain === downlinkDrain) remoteConnWrapper.downlinkDrain = Promise.resolve();
 			try { socket?.close?.() } catch (_) { }
@@ -2204,7 +2244,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 		}
 		remoteConnWrapper.socket = socket;
 		if (仅建立连接) return socket;
-		connectStreams(socket, ws, 取出响应头, retryFunc, 连接仍有效, remoteConnWrapper).catch(err => {
+		connectStreams(socket, ws, 取出响应头, retryFunc, 连接仍有效, remoteConnWrapper, firstByteTimeoutMs).catch(err => {
 			if (!连接仍有效()) return;
 			log(`[TCP下行] 处理失败: ${err?.message || err}`);
 			try { socket?.close?.() } catch (e) { }
@@ -2312,6 +2352,57 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			try { socket?.close?.() } catch (e) { }
 			if (预加载候选列表) log(`[TCP直连] 预加载竞速失败: ${err.message || err}`);
 			throw err;
+		}
+	}
+
+	async function connectWARPDirect(data = null) {
+		const 候选地址 = 获取WARP候选地址(反代上下文).slice(0, 2);
+		let lastError = null;
+		for (const address of 候选地址) {
+			let socket = null;
+			try {
+				log(`[WARP回退] 尝试 Cloudflare anycast ${address}:443`);
+				socket = await 打开TCP连接(address, 443);
+				await 写入首包(socket, data);
+				return socket;
+			} catch (err) {
+				lastError = err;
+				try { socket?.close?.() } catch (e) { }
+				log(`[WARP回退] ${address}:443 失败: ${err?.message || err}`);
+			}
+		}
+		throw lastError || new Error('WARP Cloudflare anycast fallback failed');
+	}
+
+	let WARP已尝试 = false;
+
+	async function connecttoWARP() {
+		if (!ctxWARP可用 || WARP已尝试) return connecttoPry(!已通过代理发送首包);
+		if (remoteConnWrapper.connectingPromise) {
+			await remoteConnWrapper.connectingPromise;
+			return;
+		}
+		WARP已尝试 = true;
+		const { generation: WARP世代, downlinkDrain } = 开始TCP连接世代(remoteConnWrapper);
+		let WARPsocket = null;
+		const task = (async () => {
+			try {
+				WARPsocket = await connectWARPDirect(rawData);
+				await 安装当前连接(WARPsocket, WARP世代, downlinkDrain, async () => {
+					if (remoteConnWrapper.generation !== WARP世代 || remoteConnWrapper.socket !== WARPsocket) return;
+					await connecttoPry(!已通过代理发送首包);
+				}, ctxWARP首字节超时);
+			} catch (err) {
+				try { WARPsocket?.close?.() } catch (e) { }
+				if (remoteConnWrapper.generation === WARP世代) remoteConnWrapper.socket = null;
+				throw err;
+			}
+		})();
+		remoteConnWrapper.connectingPromise = task;
+		try {
+			await task;
+		} finally {
+			if (remoteConnWrapper.connectingPromise === task) remoteConnWrapper.connectingPromise = null;
 		}
 	}
 
@@ -2427,7 +2518,18 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			}
 		}
 	}
-	remoteConnWrapper.retryConnect = async () => connecttoPry(!已通过代理发送首包);
+	remoteConnWrapper.retryConnect = async () => {
+		if (ctxWARP可用 && !WARP已尝试) {
+			try {
+				await connecttoWARP();
+				return;
+			} catch (err) {
+				log(`[WARP回退] Cloudflare anycast 失败，继续原 EdgeTunnel 反代: ${err?.message || err}`);
+				if (ws.readyState !== WebSocket.OPEN) throw err;
+			}
+		}
+		await connecttoPry(!已通过代理发送首包);
+	};
 
 	if (ctx代理类型 && (ctx代理全局 || SOCKS5白名单.some(p => new RegExp(`^${p.replace(/\*/g, '.*')}$`, 'i').test(host)))) {
 		log(`[TCP转发] 启用 SOCKS5/HTTP/HTTPS/TURN/SSTP 全局代理`);
@@ -2447,8 +2549,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 			const initialSocket = await connectDirect(host, portNum, rawData, true);
 			await 安装当前连接(initialSocket, 直连世代, 世代连接.downlinkDrain, async () => {
 				if (remoteConnWrapper.generation !== 直连世代 || remoteConnWrapper.socket !== initialSocket) return;
-				await connecttoPry();
-			});
+				await remoteConnWrapper.retryConnect();
+			}, ctxWARP可用 ? ctxWARP首字节超时 : 0);
 			if (仅建立连接) return initialSocket;
 		} catch (err) {
 			log(`[TCP转发] 直连 ${host}:${portNum} 失败: ${err.message}`);
@@ -2458,7 +2560,7 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
 				throw err;
 			}
 			if (ws.readyState !== WebSocket.OPEN) throw err;
-			await connecttoPry();
+			await remoteConnWrapper.retryConnect();
 			if (仅建立连接) return remoteConnWrapper.socket;
 		}
 	}
@@ -3023,7 +3125,7 @@ function 创建下行Grain发送器(webSocket, headerData = null, isActive = nul
 	};
 }
 
-async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, isCurrentSocket = null, remoteConnWrapper = null) {
+async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, isCurrentSocket = null, remoteConnWrapper = null, firstByteTimeoutMs = 0) {
 	let header = headerData, hasData = false, reader, useBYOB = false, readError = null;
 	const BYOB单次读取上限 = 64 * 1024;
 	const 当前连接仍有效 = () => !isCurrentSocket || isCurrentSocket();
@@ -3036,6 +3138,19 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 	try { reader = remoteSocket.readable.getReader({ mode: 'byob' }); useBYOB = true }
 	catch (e) { reader = remoteSocket.readable.getReader() }
 
+	let 首字节定时器 = null;
+	const 清理首字节定时器 = () => {
+		if (首字节定时器) clearTimeout(首字节定时器);
+		首字节定时器 = null;
+	};
+	if (retryFunc && Number(firstByteTimeoutMs) > 0) {
+		首字节定时器 = setTimeout(() => {
+			if (hasData || !当前连接仍有效()) return;
+			log(`[TCP下行] ${firstByteTimeoutMs}ms 未收到首字节，关闭当前 socket 并触发重试`);
+			try { remoteSocket.close() } catch (e) { }
+		}, Number(firstByteTimeoutMs));
+	}
+
 	try {
 		if (!useBYOB) {
 			while (true) {
@@ -3043,7 +3158,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 				if (!当前连接仍有效()) break;
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
-				hasData = true;
+				if (!hasData) { hasData = true; 清理首字节定时器(); }
 				if (value.byteLength >= 下行Grain包字节) {
 					await 下行发送器.flush();
 					await 下行发送器.直接发送(value);
@@ -3058,7 +3173,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 				if (!当前连接仍有效()) break;
 				if (done) break;
 				if (!value || value.byteLength === 0) continue;
-				hasData = true;
+				if (!hasData) { hasData = true; 清理首字节定时器(); }
 				if (value.byteLength >= 下行Grain包字节) {
 					await 下行发送器.flush();
 					await 下行发送器.直接发送(value);
@@ -3072,6 +3187,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, is
 		if (当前连接仍有效()) await 下行发送器.flush();
 	} catch (err) { readError = err }
 	finally {
+		清理首字节定时器();
 		if (当前连接仍有效() && webSocket.readyState === WebSocket.OPEN) {
 			try { await 下行发送器.停止并刷新() } catch (err) { readError ||= err }
 		}
