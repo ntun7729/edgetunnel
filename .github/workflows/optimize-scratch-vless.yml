@@ -1,0 +1,147 @@
+name: Optimize scratch VLESS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/optimize-scratch-vless.yml
+
+permissions:
+  contents: write
+
+jobs:
+  optimize-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Apply performance patch
+        run: |
+          set -euxo pipefail
+          python3 tools/optimize_scratch_vless.py
+          node --check worker.js
+          git diff --check
+          grep -q "ws.binaryType = 'arraybuffer'" worker.js
+          grep -q "classifyCloudflareHost" worker.js
+          grep -q "connectRace" worker.js
+          grep -q "WS_DOWNLOAD_BATCH_BYTES" worker.js
+          grep -q "cacheRoute(host, isFallback ? 'cf' : 'direct'" worker.js
+
+      - name: Wrangler dry-run
+        run: npx --yes wrangler@latest deploy --dry-run --config wrangler.scratch.toml --outdir /tmp/scratch-build
+
+      - name: Install Xray
+        run: |
+          set -euxo pipefail
+          TAG=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          curl -fsSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-linux-64.zip"
+          unzip -q /tmp/xray.zip -d /tmp/xray
+          /tmp/xray/xray version
+
+      - name: Start direct-regression Worker
+        run: |
+          set -euxo pipefail
+          cp wrangler.scratch.toml /tmp/wrangler-direct.toml
+          sed -i 's#main = "worker.js"#main = "'"$(pwd)"'/worker.js"#' /tmp/wrangler-direct.toml
+          nohup npx --yes wrangler@latest dev --config /tmp/wrangler-direct.toml --ip 127.0.0.1 --port 8787 \
+            --var UUID:00112233-4455-6677-8899-aabbccddeeff \
+            --var DEBUG:true \
+            --var CF_FALLBACK:off \
+            --var CONNECT_RACE:2 > /tmp/direct-worker.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fsS 'http://127.0.0.1:8787/health?detail=1' >/tmp/direct-health.txt 2>/dev/null && break
+            sleep 1
+          done
+          cat /tmp/direct-health.txt
+          grep -q 'ws_binary=arraybuffer' /tmp/direct-health.txt
+          grep -q 'connect_race=2' /tmp/direct-health.txt
+
+      - name: Start direct Xray and regression test
+        run: |
+          set -euxo pipefail
+          cat >/tmp/direct-xray.json <<'JSON'
+          {
+            "log":{"loglevel":"warning"},
+            "inbounds":[{"listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[{
+              "protocol":"vless",
+              "settings":{"vnext":[{"address":"127.0.0.1","port":8787,"users":[{"id":"00112233-4455-6677-8899-aabbccddeeff","encryption":"none"}]}]},
+              "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vless"}},
+              "mux":{"enabled":false}
+            }]
+          }
+          JSON
+          nohup /tmp/xray/xray run -config /tmp/direct-xray.json >/tmp/direct-xray.log 2>&1 &
+          sleep 2
+          curl -L -fsS -o /dev/null --max-time 20 --socks5-hostname 127.0.0.1:10808 https://www.google.com/
+          curl -L -fsS -o /dev/null --max-time 20 --socks5-hostname 127.0.0.1:10808 https://example.com/
+
+      - name: Start fallback-performance Worker
+        run: |
+          set -euxo pipefail
+          cp wrangler.scratch.toml /tmp/wrangler-fallback.toml
+          sed -i 's#main = "worker.js"#main = "'"$(pwd)"'/worker.js"#' /tmp/wrangler-fallback.toml
+          nohup npx --yes wrangler@latest dev --config /tmp/wrangler-fallback.toml --ip 127.0.0.1 --port 8788 \
+            --var UUID:00112233-4455-6677-8899-aabbccddeeff \
+            --var DEBUG:true \
+            --var CF_FALLBACK:auto \
+            --var CF_FALLBACK_IPS:104.16.0.1,104.17.0.1,104.18.0.1 \
+            --var CF_FALLBACK_FIRST_BYTE_MS:800 \
+            --var CONNECT_RACE:2 > /tmp/fallback-worker.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fsS 'http://127.0.0.1:8788/health?detail=1' >/tmp/fallback-health.txt 2>/dev/null && break
+            sleep 1
+          done
+          cat /tmp/fallback-health.txt
+          grep -q 'cf_classify=on' /tmp/fallback-health.txt
+
+      - name: Start fallback Xray and benchmark
+        run: |
+          set -euxo pipefail
+          cat >/tmp/fallback-xray.json <<'JSON'
+          {
+            "log":{"loglevel":"warning"},
+            "inbounds":[{"listen":"127.0.0.1","port":10809,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[{
+              "protocol":"vless",
+              "settings":{"vnext":[{"address":"127.0.0.1","port":8788,"users":[{"id":"00112233-4455-6677-8899-aabbccddeeff","encryption":"none"}]}]},
+              "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vless"}},
+              "mux":{"enabled":false}
+            }]
+          }
+          JSON
+          nohup /tmp/xray/xray run -config /tmp/fallback-xray.json >/tmp/fallback-xray.log 2>&1 &
+          sleep 2
+
+          for url in https://www.cloudflare.com/ https://one.one.one.one/ https://speed.cloudflare.com/; do
+            curl -L -fsS -o /dev/null --max-time 20 --socks5-hostname 127.0.0.1:10809 \
+              -w "$url starttransfer=%{time_starttransfer}s total=%{time_total}s speed=%{speed_download}B/s\n" "$url"
+          done
+
+          curl -L -fsS --max-time 30 --socks5-hostname 127.0.0.1:10809 \
+            -o /tmp/5mb.bin \
+            -w '5MB total=%{time_total}s speed=%{speed_download}B/s bytes=%{size_download}\n' \
+            'https://speed.cloudflare.com/__down?bytes=5000000'
+          size=$(stat -c%s /tmp/5mb.bin)
+          test "$size" -ge 4900000
+
+          echo '--- FALLBACK WORKER LOG ---'
+          cat /tmp/fallback-worker.log
+          grep -q 'route hint' /tmp/fallback-worker.log
+          grep -q 'CF fallback' /tmp/fallback-worker.log
+
+      - name: Commit optimized Worker
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add worker.js
+          git commit -m "perf: accelerate standalone VLESS transport"
+          git push origin HEAD:main
