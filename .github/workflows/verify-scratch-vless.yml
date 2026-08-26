@@ -61,3 +61,5 @@ jobs:
           console.log('scratch VLESS verification passed');
           NODE
           node /tmp/test.mjs
+      - name: Wrangler dry-run build
+        run: npx --yes wrangler@latest deploy --dry-run --config wrangler.scratch.toml --outdir /tmp/scratch-vless-build
