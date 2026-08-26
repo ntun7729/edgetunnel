@@ -1,0 +1,48 @@
+name: Fix scratch VLESS Blob frames
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/fix-scratch-vless-blob.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Patch Blob handling
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('worker.js')
+          s = p.read_text()
+          old = """function toBytes(data) {\n  if (data instanceof Uint8Array) return data;\n  if (data instanceof ArrayBuffer) return new Uint8Array(data);\n  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);\n  throw new TypeError('binary WebSocket message required');\n}\n"""
+          new = """function toBytes(data) {\n  if (data instanceof Uint8Array) return data;\n  if (data instanceof ArrayBuffer) return new Uint8Array(data);\n  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);\n  throw new TypeError('binary data required');\n}\n\nasync function toWebSocketBytes(data) {\n  if (typeof Blob !== 'undefined' && data instanceof Blob) {\n    return new Uint8Array(await data.arrayBuffer());\n  }\n  return toBytes(data);\n}\n"""
+          if old not in s:
+              raise SystemExit('toBytes anchor not found')
+          s = s.replace(old, new, 1)
+          old2 = """    const bytes = toBytes(chunk);\n    if (bytes.byteLength > MAX_WS_MESSAGE_BYTES) throw new Error('WebSocket message too large');\n"""
+          new2 = """    const bytes = await toWebSocketBytes(chunk);\n    if (bytes.byteLength > MAX_WS_MESSAGE_BYTES) throw new Error('WebSocket message too large');\n"""
+          if old2 not in s:
+              raise SystemExit('consumeBinary anchor not found')
+          s = s.replace(old2, new2, 1)
+          p.write_text(s)
+          PY
+          node --check worker.js
+          git diff --check
+      - name: Commit fix
+        shell: bash
+        run: |
+          git config user.name ntun7729
+          git config user.email ntun77.19@gmail.com
+          git add worker.js
+          git commit -m "fix: accept Blob WebSocket binary frames"
+          git push origin HEAD:main
