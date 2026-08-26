@@ -1,0 +1,112 @@
+name: Add colo-adaptive fallback routing
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/add-colo-adaptive-routing.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Apply adaptive routing patch
+        run: |
+          set -euxo pipefail
+          python3 tools/add_colo_adaptive_routing.py
+          node --check worker.js
+          git diff --check
+          grep -q 'rankFallbackCandidates' worker.js
+          grep -q 'recordCfSuccess' worker.js
+          grep -q "'/route-stats'" worker.js
+          grep -q 'cf_best_candidate' worker.js
+          grep -q 'CF_EXPLORE_EVERY' worker.js
+
+      - name: Wrangler dry-run
+        run: npx --yes wrangler@latest deploy --dry-run --config wrangler.scratch.toml --outdir /tmp/scratch-build
+
+      - name: Install Xray
+        run: |
+          set -euxo pipefail
+          TAG=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          curl -fsSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-linux-64.zip"
+          unzip -q /tmp/xray.zip -d /tmp/xray
+
+      - name: Start adaptive Worker
+        run: |
+          set -euxo pipefail
+          cp wrangler.scratch.toml /tmp/wrangler-adaptive.toml
+          sed -i 's#main = "worker.js"#main = "'"$(pwd)"'/worker.js"#' /tmp/wrangler-adaptive.toml
+          nohup npx --yes wrangler@latest dev --config /tmp/wrangler-adaptive.toml --ip 127.0.0.1 --port 8788 \
+            --var UUID:00112233-4455-6677-8899-aabbccddeeff \
+            --var CONFIG_TOKEN:diag \
+            --var DEBUG:true \
+            --var CF_FALLBACK:auto \
+            --var CF_FALLBACK_IPS:104.16.0.1,104.17.0.1,104.18.0.1 \
+            --var CF_EXPLORE_EVERY:2 \
+            --var CONNECT_RACE:2 > /tmp/worker.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fsS 'http://127.0.0.1:8788/health?detail=1' >/tmp/health.txt 2>/dev/null && break
+            sleep 1
+          done
+          cat /tmp/health.txt
+          grep -q 'colo=' /tmp/health.txt
+          grep -q 'location_key=' /tmp/health.txt
+          grep -q 'cf_explore_every=2' /tmp/health.txt
+
+      - name: Start Xray
+        run: |
+          cat >/tmp/xray.json <<'JSON'
+          {
+            "log":{"loglevel":"warning"},
+            "inbounds":[{"listen":"127.0.0.1","port":10809,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[{
+              "protocol":"vless",
+              "settings":{"vnext":[{"address":"127.0.0.1","port":8788,"users":[{"id":"00112233-4455-6677-8899-aabbccddeeff","encryption":"none"}]}]},
+              "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vless"}},
+              "mux":{"enabled":false}
+            }]
+          }
+          JSON
+          nohup /tmp/xray/xray run -config /tmp/xray.json >/tmp/xray.log 2>&1 &
+          sleep 2
+
+      - name: Exercise adaptive Cloudflare candidates
+        run: |
+          set -euxo pipefail
+          for i in $(seq 1 8); do
+            curl -L -fsS -o /dev/null --max-time 20 --socks5-hostname 127.0.0.1:10809 'https://speed.cloudflare.com/__down?bytes=100000'
+          done
+          curl -fsS 'http://127.0.0.1:8788/route-stats?token=diag' -o /tmp/stats.json
+          cat /tmp/stats.json
+          jq -e '.scope == "current Worker isolate"' /tmp/stats.json
+          jq -e '[.candidates[].successes] | add > 0' /tmp/stats.json
+          jq -e '[.candidates[] | select(.samples > 0)] | length >= 2' /tmp/stats.json
+          grep -q 'CF candidate success' /tmp/worker.log
+
+      - name: Direct regression
+        run: |
+          set -euxo pipefail
+          curl -L -fsS -o /dev/null --max-time 20 --socks5-hostname 127.0.0.1:10809 https://example.com/
+          curl -L -fsS -o /dev/null --max-time 20 --socks5-hostname 127.0.0.1:10809 https://www.google.com/
+
+      - name: Commit worker directly to main
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add worker.js
+          git commit -m "perf: learn fastest Cloudflare fallback per colo"
+          git push origin HEAD:main
