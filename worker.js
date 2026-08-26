@@ -13,6 +13,9 @@ const MAX_VLESS_HEADER_BYTES = 4096;
 const MAX_UDP_DATAGRAM_BYTES = 65535;
 const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
+const CF_FALLBACK_IPS = ['104.16.0.1', '104.17.0.1', '104.18.0.1'];
+const DEFAULT_CF_FIRST_BYTE_MS = 1200;
+const MAX_REPLAY_BYTES = 1024 * 1024;
 
 function textResponse(body, status = 200, headers = {}) {
   return new Response(body, {
@@ -225,6 +228,20 @@ function getConnector(request) {
   return (target, options) => connect(target, options);
 }
 
+function hasRequestFetcher(request) {
+  return Boolean(request?.fetcher && typeof request.fetcher.connect === 'function');
+}
+
+function selectCfFallback(host, attempt = 0) {
+  let hash = 2166136261;
+  const text = String(host || 'cf');
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return CF_FALLBACK_IPS[(hash + attempt) % CF_FALLBACK_IPS.length];
+}
+
 function wait(ms, value, reject = false) {
   return new Promise((resolve, rejectFn) => setTimeout(() => (reject ? rejectFn(value) : resolve(value)), ms));
 }
@@ -284,69 +301,221 @@ function createIdleWatchdog(timeoutMs, onTimeout) {
 }
 
 async function handleTcpSession({ ws, connector, requestMeta, initialPayload, version, host, port, config, log }) {
-  const socket = await connectWithTimeout(connector, host, port, config.connectTimeoutMs);
-  log('TCP connected', `${host}:${port}`, requestMeta.connectorName);
-
-  const writer = socket.writable.getWriter();
   let closed = false;
+  let socket = null;
+  let writer = null;
+  let reader = null;
+  let generation = 0;
+  let firstByteSeen = false;
+  let firstByteTimer = null;
+  let fallbackAttempted = false;
+  let switching = false;
+  let switchPromise = Promise.resolve();
   let uplink = Promise.resolve();
+  let doneResolve;
+  const done = new Promise((resolve) => { doneResolve = resolve; });
+  const replay = [];
+  let replayBytes = 0;
+  let nextChunkId = 0;
+  let replayedThroughId = -1;
+
+  const canCfFallback = requestMeta.supportsCloudflareFallback && port === 443 && config.cfFallbackMode !== 'off';
+  const forceCfFallback = canCfFallback && config.cfFallbackMode === 'force';
+
   const idle = createIdleWatchdog(config.idleTimeoutMs, () => {
     log('idle timeout', `${host}:${port}`);
     closeAll(1000, 'idle timeout');
   });
 
+  const clearFirstByteTimer = () => {
+    if (firstByteTimer) clearTimeout(firstByteTimer);
+    firstByteTimer = null;
+  };
+
+  const closeCurrent = () => {
+    clearFirstByteTimer();
+    try { reader?.cancel(); } catch {}
+    try { reader?.releaseLock(); } catch {}
+    try { writer?.releaseLock(); } catch {}
+    try { socket?.close(); } catch {}
+    reader = null;
+    writer = null;
+    socket = null;
+  };
+
   const closeAll = (code = 1000, reason = '') => {
     if (closed) return;
     closed = true;
     idle.stop();
-    try { writer.releaseLock(); } catch {}
-    try { socket.close(); } catch {}
+    generation++;
+    closeCurrent();
     safeWsClose(ws, code, reason);
+    doneResolve?.();
   };
+
+  const rememberChunk = (chunk) => {
+    const bytes = toBytes(chunk);
+    const copy = bytes.slice();
+    const item = { id: nextChunkId++, bytes: copy };
+    if (!firstByteSeen && replayBytes + copy.byteLength <= MAX_REPLAY_BYTES) {
+      replay.push(item);
+      replayBytes += copy.byteLength;
+    }
+    return item;
+  };
+
+  const markFirstByte = () => {
+    if (firstByteSeen) return;
+    firstByteSeen = true;
+    clearFirstByteTimer();
+    replay.length = 0;
+    replayBytes = 0;
+  };
+
+  const startDownlink = (myGeneration, isFallback) => {
+    const myReader = reader;
+    (async () => {
+      try {
+        while (!closed && myGeneration === generation) {
+          const { value, done: streamDone } = await myReader.read();
+          if (streamDone) {
+            if (!firstByteSeen && !isFallback && canCfFallback) {
+              await triggerCfFallback('direct EOF before first byte');
+            } else if (myGeneration === generation) {
+              closeAll(1000, 'remote closed');
+            }
+            return;
+          }
+          if (!value?.byteLength) continue;
+          if (myGeneration !== generation || closed) return;
+          markFirstByte();
+          idle.arm();
+          await waitForWsBackpressure(ws);
+          sendWs(ws, value);
+        }
+      } catch (error) {
+        if (closed || myGeneration !== generation) return;
+        if (!firstByteSeen && !isFallback && canCfFallback) {
+          try {
+            await triggerCfFallback(`direct read failed: ${error?.message || error}`);
+            return;
+          } catch {}
+        }
+        log('downlink failed', error?.message || error);
+        closeAll(1011, 'downlink failed');
+      } finally {
+        try { myReader.releaseLock(); } catch {}
+      }
+    })();
+  };
+
+  const openTarget = async (targetHost, label, isFallback) => {
+    const myGeneration = ++generation;
+    const newSocket = await connectWithTimeout(connector, targetHost, port, config.connectTimeoutMs);
+    if (closed || myGeneration !== generation) {
+      try { newSocket.close(); } catch {}
+      throw new Error('connection superseded');
+    }
+    socket = newSocket;
+    writer = socket.writable.getWriter();
+    reader = socket.readable.getReader();
+    log('TCP connected', `${host}:${port}`, requestMeta.connectorName, label, targetHost);
+    startDownlink(myGeneration, isFallback);
+  };
+
+  const writeReplay = async () => {
+    let i = 0;
+    while (!closed && i < replay.length) {
+      const item = replay[i++];
+      await writer.write(item.bytes);
+      replayedThroughId = Math.max(replayedThroughId, item.id);
+    }
+  };
+
+  async function triggerCfFallback(reason) {
+    if (!canCfFallback || fallbackAttempted || firstByteSeen || closed) {
+      throw new Error('Cloudflare fallback unavailable');
+    }
+    fallbackAttempted = true;
+    switching = true;
+    clearFirstByteTimer();
+    generation++;
+    closeCurrent();
+    const fallbackIp = selectCfFallback(host, 0);
+    log('CF fallback', reason, `${host}:${port}`, 'via', fallbackIp);
+    switchPromise = (async () => {
+      await openTarget(fallbackIp, 'cf-anycast', true);
+      await writeReplay();
+      switching = false;
+      idle.arm();
+    })().catch((error) => {
+      switching = false;
+      log('CF fallback failed', error?.message || error);
+      closeAll(1011, 'Cloudflare fallback failed');
+      throw error;
+    });
+    return switchPromise;
+  }
 
   const queueUplink = (chunk) => {
     const bytes = toBytes(chunk);
     if (!bytes.byteLength || closed) return uplink;
+    const item = rememberChunk(bytes);
+    const queuedGeneration = generation;
     idle.arm();
     uplink = uplink.then(async () => {
       if (closed) return;
-      await writer.write(bytes);
+      if (switching) {
+        await switchPromise;
+        if (item.id <= replayedThroughId) return;
+      }
+      if (queuedGeneration !== generation && item.id <= replayedThroughId) return;
+      if (!writer) throw new Error('TCP writer unavailable');
+      await writer.write(item.bytes);
     }).catch((error) => {
-      log('uplink failed', error?.message || error);
-      closeAll(1011, 'uplink failed');
+      if (!closed) {
+        log('uplink failed', error?.message || error);
+        closeAll(1011, 'uplink failed');
+      }
       throw error;
     });
     return uplink;
   };
 
-  sendWs(ws, makeVlessResponseHeader(version));
-  idle.arm();
-  if (initialPayload?.byteLength) await queueUplink(initialPayload);
+  if (initialPayload?.byteLength) rememberChunk(initialPayload);
 
-  const reader = socket.readable.getReader();
-  const downlinkTask = (async () => {
-    try {
-      while (!closed) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (!value?.byteLength) continue;
-        idle.arm();
-        await waitForWsBackpressure(ws);
-        sendWs(ws, value);
+  try {
+    if (forceCfFallback) {
+      fallbackAttempted = true;
+      await openTarget(selectCfFallback(host, 0), 'cf-anycast-force', true);
+    } else {
+      try {
+        await openTarget(host, 'direct', false);
+      } catch (error) {
+        if (!canCfFallback) throw error;
+        fallbackAttempted = false;
+        await triggerCfFallback(`direct connect failed: ${error?.message || error}`);
       }
-      closeAll(1000, 'remote closed');
-    } catch (error) {
-      if (!closed) {
-        log('downlink failed', error?.message || error);
-        closeAll(1011, 'downlink failed');
-      }
-    } finally {
-      try { await reader.cancel(); } catch {}
-      try { reader.releaseLock(); } catch {}
     }
-  })();
 
-  return { queueUplink, closeAll, done: downlinkTask };
+    sendWs(ws, makeVlessResponseHeader(version));
+    idle.arm();
+    if (!switching && writer && replay.length) await writeReplay();
+    else if (switching) await switchPromise;
+
+    if (!firstByteSeen && canCfFallback && !forceCfFallback && !fallbackAttempted) {
+      firstByteTimer = setTimeout(() => {
+        if (!closed && !firstByteSeen && !fallbackAttempted) {
+          triggerCfFallback(`${config.cfFirstByteMs}ms without first byte`).catch(() => {});
+        }
+      }, config.cfFirstByteMs);
+    }
+  } catch (error) {
+    closeAll(1011, error?.message || 'TCP connect failed');
+    throw error;
+  }
+
+  return { queueUplink, closeAll, done };
 }
 
 function appendUdpBuffer(state, chunk) {
@@ -467,6 +636,10 @@ function buildConfig(env, request) {
     dohUrl: parsedDoh.toString(),
     connectTimeoutMs: clampInteger(env.CONNECT_TIMEOUT_MS, DEFAULT_CONNECT_TIMEOUT_MS, 500, 15000),
     idleTimeoutMs: clampInteger(env.IDLE_TIMEOUT_MS, DEFAULT_IDLE_TIMEOUT_MS, 10000, 600000),
+    cfFirstByteMs: clampInteger(env.CF_FIRST_BYTE_MS, DEFAULT_CF_FIRST_BYTE_MS, 250, 5000),
+    cfFallbackMode: ['auto', 'off', 'force'].includes(String(env.CF_FALLBACK || 'auto').toLowerCase())
+      ? String(env.CF_FALLBACK || 'auto').toLowerCase()
+      : 'auto',
     publicHost: normalizePublicHost(env.HOST || url.host),
   };
 }
@@ -499,7 +672,8 @@ async function handleVlessWebSocket(request, env, ctx, config, users) {
   const log = createLogger(env, request);
   const connector = getConnector(request);
   const requestMeta = {
-    connectorName: request?.fetcher && typeof request.fetcher.connect === 'function' ? 'request.fetcher.connect' : 'cloudflare:sockets',
+    connectorName: hasRequestFetcher(request) ? 'request.fetcher.connect' : 'cloudflare:sockets',
+    supportsCloudflareFallback: hasRequestFetcher(request),
   };
 
   let headerBuffer = new Uint8Array(0);
@@ -607,7 +781,14 @@ export default {
       if (!configuredToken || !constantTimeTextEqual(configuredToken, suppliedToken)) return textResponse('Not found', 404);
       return textResponse(configText(env, request, users, config));
     }
-    if (url.pathname === '/health') return textResponse(users.length ? 'ok' : 'misconfigured', users.length ? 200 : 503);
+    if (url.pathname === '/health') {
+      const healthy = users.length > 0;
+      if (url.searchParams.get('detail') === '1') {
+        const connectorName = hasRequestFetcher(request) ? 'request.fetcher.connect' : 'cloudflare:sockets';
+        return textResponse(`${healthy ? 'ok' : 'misconfigured'}\nconnector=${connectorName}\ncf_fallback=${config.cfFallbackMode}\ncf_first_byte_ms=${config.cfFirstByteMs}`, healthy ? 200 : 503);
+      }
+      return textResponse(healthy ? 'ok' : 'misconfigured', healthy ? 200 : 503);
+    }
     if (url.pathname === '/') {
       const body = request.method === 'HEAD' ? null : htmlLanding();
       return new Response(body, {
