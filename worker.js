@@ -83,7 +83,14 @@ function toBytes(data) {
   if (data instanceof Uint8Array) return data;
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
   if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  throw new TypeError('binary WebSocket message required');
+  throw new TypeError('binary data required');
+}
+
+async function toWebSocketBytes(data) {
+  if (typeof Blob !== 'undefined' && data instanceof Blob) {
+    return new Uint8Array(await data.arrayBuffer());
+  }
+  return toBytes(data);
 }
 
 function parseVlessHeader(buf, allowedUsers) {
@@ -509,7 +516,7 @@ async function handleVlessWebSocket(request, env, ctx, config, users) {
 
   const consumeBinary = async (chunk) => {
     if (closed) return;
-    const bytes = toBytes(chunk);
+    const bytes = await toWebSocketBytes(chunk);
     if (bytes.byteLength > MAX_WS_MESSAGE_BYTES) throw new Error('WebSocket message too large');
 
     if (session) {
