@@ -1,0 +1,88 @@
+name: Diagnose scratch VLESS Cloudflare destinations
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/diag-scratch-cf.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Xray
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TAG=$(curl -fsSL https://api.github.com/repos/XTLS/Xray-core/releases/latest | jq -r .tag_name)
+          curl -fsSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${TAG}/Xray-linux-64.zip"
+          unzip -q /tmp/xray.zip -d /tmp/xray
+          /tmp/xray/xray version
+
+      - name: Start scratch Worker and Xray
+        shell: bash
+        run: |
+          set -euxo pipefail
+          nohup npx --yes wrangler@latest dev --config wrangler.scratch.toml --ip 127.0.0.1 --port 8787 --var UUID:00112233-4455-6677-8899-aabbccddeeff --var DEBUG:true > /tmp/worker.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8787/health >/dev/null 2>&1 && break
+            sleep 1
+          done
+          cat >/tmp/xray.json <<'JSON'
+          {
+            "log":{"loglevel":"warning"},
+            "inbounds":[{"listen":"127.0.0.1","port":10808,"protocol":"socks","settings":{"udp":true}}],
+            "outbounds":[{
+              "protocol":"vless",
+              "settings":{"vnext":[{"address":"127.0.0.1","port":8787,"users":[{"id":"00112233-4455-6677-8899-aabbccddeeff","encryption":"none"}]}]},
+              "streamSettings":{"network":"ws","security":"none","wsSettings":{"path":"/vless"}},
+              "mux":{"enabled":false}
+            }]
+          }
+          JSON
+          nohup /tmp/xray/xray run -config /tmp/xray.json >/tmp/xray.log 2>&1 &
+          sleep 2
+
+      - name: VLESS destination matrix
+        shell: bash
+        run: |
+          set +e
+          : >/tmp/results.txt
+          for url in \
+            https://www.google.com/ \
+            https://github.com/ \
+            https://www.cloudflare.com/ \
+            https://one.one.one.one/ \
+            https://speed.cloudflare.com/ \
+            https://example.com/; do
+            code=$(curl -L -sS -o /dev/null -w '%{http_code}' --max-time 15 --socks5-hostname 127.0.0.1:10808 "$url")
+            rc=$?
+            printf '%-36s rc=%-3s http=%s\n' "$url" "$rc" "$code" | tee -a /tmp/results.txt
+          done
+          echo '--- matrix ---'
+          cat /tmp/results.txt
+          echo '--- worker log ---'
+          cat /tmp/worker.log
+          echo '--- xray log ---'
+          cat /tmp/xray.log
+          exit 0
+
+      - name: Probe Cloudflare anycast candidates
+        shell: bash
+        run: |
+          set +e
+          for ip in 104.16.0.1 104.17.0.1 104.18.0.1 172.64.0.1 162.159.36.1 162.159.46.1; do
+            code=$(curl -L -sS -o /dev/null -w '%{http_code}' --connect-timeout 4 --max-time 8 --resolve www.cloudflare.com:443:$ip https://www.cloudflare.com/)
+            rc=$?
+            echo "$ip rc=$rc http=$code"
+          done
+          exit 0
