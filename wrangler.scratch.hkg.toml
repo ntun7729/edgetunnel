@@ -1,0 +1,12 @@
+name = "scratch-vless-hkg"
+main = "worker.js"
+compatibility_date = "2026-08-26"
+compatibility_flags = ["no_web_socket_compression"]
+keep_vars = true
+
+[placement]
+region = "aws:ap-east-1"
+
+[vars]
+PATH = "/vless"
+DOH_URL = "https://cloudflare-dns.com/dns-query"
