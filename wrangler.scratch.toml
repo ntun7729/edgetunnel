@@ -1,0 +1,8 @@
+name = "scratch-vless"
+main = "worker.js"
+compatibility_date = "2026-08-26"
+keep_vars = true
+
+[vars]
+PATH = "/vless"
+DOH_URL = "https://cloudflare-dns.com/dns-query"
