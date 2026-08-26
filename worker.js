@@ -1,7 +1,9 @@
 // Standalone VLESS-over-WebSocket Worker, written from scratch.
 // Runtime dependencies: Cloudflare Workers built-ins only.
 // Required env: UUID (one UUID) or UUIDS (comma/space-separated UUIDs).
-// Optional env: PATH, DOH_URL, CONNECT_TIMEOUT_MS, IDLE_TIMEOUT_MS, HOST, DEBUG, CONFIG_TOKEN.
+// Optional env: PATH, DOH_URL, CONNECT_TIMEOUT_MS, IDLE_TIMEOUT_MS, HOST, DEBUG, CONFIG_TOKEN,
+// CF_FALLBACK, CF_FALLBACK_IPS, CF_FIRST_BYTE_MS, CF_FALLBACK_FIRST_BYTE_MS,
+// CF_CLASSIFY, CF_CLASSIFY_TIMEOUT_MS, CF_EXPLORE_EVERY, CONNECT_RACE.
 
 import { connect } from 'cloudflare:sockets';
 
@@ -38,6 +40,11 @@ const WS_DOWNLOAD_BATCH_DELAY_MS = 1;
 const MAX_REPLAY_BYTES = 1024 * 1024;
 const ROUTE_CACHE_MAX = 512;
 const ROUTE_CACHE = new Map();
+const CF_PERF_STATS_MAX = 2048;
+const CF_PERF_STATS = new Map();
+const CF_ROUTE_USES_MAX = 2048;
+const CF_ROUTE_USES = new Map();
+const DEFAULT_CF_EXPLORE_EVERY = 8;
 
 function textResponse(body, status = 200, headers = {}) {
   return new Response(body, {
@@ -329,23 +336,163 @@ function getCachedRoute(host) {
   return entry;
 }
 
+function requestLocation(request) {
+  const colo = String(request?.cf?.colo || '').trim().toUpperCase();
+  const placement = String(request?.headers?.get?.('cf-placement') || '').trim();
+  return {
+    colo: colo || '-',
+    placement: placement || '-',
+    key: placement || colo || 'UNKNOWN',
+  };
+}
+
+function perfKey(locationKey, ip) {
+  return `${String(locationKey || 'UNKNOWN')}|${String(ip || '')}`;
+}
+
+function getCfPerf(locationKey, ip) {
+  return CF_PERF_STATS.get(perfKey(locationKey, ip)) || null;
+}
+
+function touchCfPerf(locationKey, ip) {
+  const key = perfKey(locationKey, ip);
+  let stat = CF_PERF_STATS.get(key);
+  if (!stat) {
+    stat = {
+      ip,
+      location: String(locationKey || 'UNKNOWN'),
+      successes: 0,
+      failures: 0,
+      consecutiveFailures: 0,
+      ewmaMs: null,
+      lastMs: null,
+      lastSuccess: 0,
+      lastFailure: 0,
+      lastError: '',
+    };
+    CF_PERF_STATS.set(key, stat);
+  } else {
+    CF_PERF_STATS.delete(key);
+    CF_PERF_STATS.set(key, stat);
+  }
+  while (CF_PERF_STATS.size > CF_PERF_STATS_MAX) {
+    const oldest = CF_PERF_STATS.keys().next().value;
+    if (oldest === undefined) break;
+    CF_PERF_STATS.delete(oldest);
+  }
+  return stat;
+}
+
+function recordCfSuccess(locationKey, ip, elapsedMs) {
+  if (!ip) return;
+  const stat = touchCfPerf(locationKey, ip);
+  const ms = Math.max(0, Number(elapsedMs) || 0);
+  stat.successes += 1;
+  stat.consecutiveFailures = 0;
+  stat.lastMs = ms;
+  stat.ewmaMs = stat.ewmaMs == null ? ms : (stat.ewmaMs * 0.72) + (ms * 0.28);
+  stat.lastSuccess = Date.now();
+  stat.lastError = '';
+}
+
+function recordCfFailure(locationKey, ip, error = '') {
+  if (!ip) return;
+  const stat = touchCfPerf(locationKey, ip);
+  stat.failures += 1;
+  stat.consecutiveFailures += 1;
+  stat.lastFailure = Date.now();
+  stat.lastError = String(error || '').slice(0, 120);
+}
+
+function cfCandidateScore(stat) {
+  if (!stat) return 100000;
+  const total = stat.successes + stat.failures;
+  if (!stat.successes) return 50000 + stat.failures * 5000;
+  const failureRate = total ? stat.failures / total : 0;
+  return (stat.ewmaMs ?? 1000) + failureRate * 1200 + stat.consecutiveFailures * 1600;
+}
+
+function bumpRouteUse(locationKey, host) {
+  const key = `${String(locationKey || 'UNKNOWN')}|${String(host || '').toLowerCase()}`;
+  const next = (CF_ROUTE_USES.get(key) || 0) + 1;
+  CF_ROUTE_USES.delete(key);
+  CF_ROUTE_USES.set(key, next);
+  while (CF_ROUTE_USES.size > CF_ROUTE_USES_MAX) {
+    const oldest = CF_ROUTE_USES.keys().next().value;
+    if (oldest === undefined) break;
+    CF_ROUTE_USES.delete(oldest);
+  }
+  return next;
+}
+
+function rankFallbackCandidates(host, pool, preferredIp = '', locationKey = 'UNKNOWN', exploreEvery = DEFAULT_CF_EXPLORE_EVERY) {
+  const unique = [...new Set((pool?.length ? pool : CF_FALLBACK_IPS).filter(Boolean))];
+  if (!unique.length) return [];
+
+  const seed = hashText(`${locationKey}|${host}`) % unique.length;
+  const deterministic = unique.map((_, index) => unique[(seed + index) % unique.length]);
+  const orderIndex = new Map(deterministic.map((ip, index) => [ip, index]));
+  const scored = deterministic.map((ip) => ({ ip, stat: getCfPerf(locationKey, ip) }));
+  scored.sort((a, b) => {
+    const aKnown = a.stat?.successes > 0 ? 0 : 1;
+    const bKnown = b.stat?.successes > 0 ? 0 : 1;
+    if (aKnown !== bKnown) return aKnown - bKnown;
+    const delta = cfCandidateScore(a.stat) - cfCandidateScore(b.stat);
+    if (delta) return delta;
+    return orderIndex.get(a.ip) - orderIndex.get(b.ip);
+  });
+
+  let ordered = scored.map((entry) => entry.ip);
+  if (preferredIp && ordered.includes(preferredIp)) {
+    const preferredStat = getCfPerf(locationKey, preferredIp);
+    if (!preferredStat || preferredStat.consecutiveFailures < 2) {
+      ordered = [preferredIp, ...ordered.filter((ip) => ip !== preferredIp)];
+    }
+  }
+
+  const useCount = bumpRouteUse(locationKey, host);
+  if (exploreEvery > 0 && useCount % exploreEvery === 0 && ordered.length > 1) {
+    const exploration = [...ordered].sort((a, b) => {
+      const sa = getCfPerf(locationKey, a);
+      const sb = getCfPerf(locationKey, b);
+      const samplesA = (sa?.successes || 0) + (sa?.failures || 0);
+      const samplesB = (sb?.successes || 0) + (sb?.failures || 0);
+      if (samplesA !== samplesB) return samplesA - samplesB;
+      return orderIndex.get(a) - orderIndex.get(b);
+    })[0];
+    if (exploration && exploration !== ordered[0]) {
+      ordered = [exploration, ...ordered.filter((ip) => ip !== exploration)];
+    }
+  }
+  return ordered;
+}
+
+function cfPerfSnapshot(locationKey, pool) {
+  const candidates = [...new Set((pool?.length ? pool : CF_FALLBACK_IPS).filter(Boolean))];
+  return candidates.map((ip) => {
+    const stat = getCfPerf(locationKey, ip);
+    return {
+      ip,
+      samples: (stat?.successes || 0) + (stat?.failures || 0),
+      successes: stat?.successes || 0,
+      failures: stat?.failures || 0,
+      consecutiveFailures: stat?.consecutiveFailures || 0,
+      ewmaMs: stat?.ewmaMs == null ? null : Math.round(stat.ewmaMs * 10) / 10,
+      lastMs: stat?.lastMs == null ? null : Math.round(stat.lastMs * 10) / 10,
+      score: Math.round(cfCandidateScore(stat) * 10) / 10,
+      lastSuccess: stat?.lastSuccess || 0,
+      lastFailure: stat?.lastFailure || 0,
+      lastError: stat?.lastError || '',
+    };
+  }).sort((a, b) => a.score - b.score || b.successes - a.successes || a.ip.localeCompare(b.ip));
+}
+
 function parseFallbackPool(value) {
   const parsed = String(value || '')
     .split(/[\s,;]+/)
     .map((item) => item.trim())
     .filter((item) => parseIpv4(item) && !isBlockedDestination(item, 443));
   return [...new Set(parsed)].slice(0, 32);
-}
-
-function buildFallbackCandidates(host, pool, preferredIp = '') {
-  const unique = [...new Set((pool?.length ? pool : CF_FALLBACK_IPS).filter(Boolean))];
-  if (!unique.length) return [];
-  const start = hashText(host) % unique.length;
-  const ordered = unique.map((_, index) => unique[(start + index) % unique.length]);
-  if (preferredIp && ordered.includes(preferredIp)) {
-    return [preferredIp, ...ordered.filter((ip) => ip !== preferredIp)];
-  }
-  return ordered;
 }
 
 async function classifyCloudflareHost(host, timeoutMs, log) {
@@ -516,6 +663,7 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
   let fallbackAttempted = false;
   let fallbackAttempt = -1;
   let activeFallbackIp = '';
+  let activeFallbackStartMs = 0;
   let switching = false;
   let switchPromise = Promise.resolve();
   let uplink = Promise.resolve();
@@ -530,13 +678,20 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
   const canCfFallback = requestMeta.supportsCloudflareFallback && port === 443 && config.cfFallbackMode !== 'off';
   const forceCfFallback = canCfFallback && config.cfFallbackMode === 'force';
   const cachedRoute = getCachedRoute(host);
+  const locationKey = requestMeta.locationKey || requestMeta.colo || 'UNKNOWN';
   const immediateCfHint = canCfFallback && (
     forceCfFallback ||
     cachedRoute?.route === 'cf' ||
     cachedRoute?.route === 'cf-hint' ||
     isKnownCloudflareHost(host)
   );
-  const fallbackCandidates = buildFallbackCandidates(host, config.cfFallbackIps, cachedRoute?.candidateIp || '');
+  const fallbackCandidates = rankFallbackCandidates(
+    host,
+    config.cfFallbackIps,
+    cachedRoute?.candidateIp || '',
+    locationKey,
+    config.cfExploreEvery,
+  );
   const shouldClassify = canCfFallback && config.cfClassify && !immediateCfHint &&
     cachedRoute?.route !== 'direct' && cachedRoute?.route !== 'not-cf' && isDomainHost(host);
   const classificationPromise = shouldClassify
@@ -577,6 +732,7 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
     writer = null;
     socket = null;
     activeFallbackIp = '';
+    activeFallbackStartMs = 0;
   };
 
   const closeAll = (code = 1000, reason = '') => {
@@ -606,6 +762,11 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
     if (firstByteSeen) return false;
     firstByteSeen = true;
     clearFirstByteTimer();
+    if (isFallback && candidateIp) {
+      const elapsedMs = activeFallbackStartMs ? Math.max(0, performance.now() - activeFallbackStartMs) : 0;
+      recordCfSuccess(locationKey, candidateIp, elapsedMs);
+      log('CF candidate success', `colo=${locationKey}`, candidateIp, `${Math.round(elapsedMs)}ms`);
+    }
     cacheRoute(host, isFallback ? 'cf' : 'direct', isFallback ? candidateIp : '');
     replay.length = 0;
     replayBytes = 0;
@@ -652,6 +813,7 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
 
   const openTarget = async (targetHost, label, isFallback, timeoutMs = config.connectTimeoutMs) => {
     const myGeneration = ++generation;
+    const attemptStartedAt = performance.now();
     const newSocket = await connectWithTimeout(connector, targetHost, port, timeoutMs, config.connectRace);
     if (closed || myGeneration !== generation) {
       try { newSocket.close(); } catch {}
@@ -662,7 +824,8 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
     reader = socket.readable.getReader();
     replayedThroughId = -1;
     activeFallbackIp = isFallback ? targetHost : '';
-    log('TCP connected', `${host}:${port}`, requestMeta.connectorName, label, targetHost, `race=${config.connectRace}`);
+    activeFallbackStartMs = isFallback ? attemptStartedAt : 0;
+    log('TCP connected', `${host}:${port}`, requestMeta.connectorName, label, targetHost, `race=${config.connectRace}`, `colo=${locationKey}`);
     startDownlink(myGeneration, isFallback, activeFallbackIp);
   };
 
@@ -679,6 +842,10 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
   async function triggerCfFallback(reason, advance = false) {
     if (!canCfFallback || firstByteSeen || closed) {
       throw new Error('Cloudflare fallback unavailable');
+    }
+    if (advance && activeFallbackIp) {
+      recordCfFailure(locationKey, activeFallbackIp, reason);
+      log('CF candidate failure', `colo=${locationKey}`, activeFallbackIp, reason);
     }
     if (!fallbackAttempted) {
       fallbackAttempted = true;
@@ -707,7 +874,8 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
           return;
         } catch (error) {
           lastError = error;
-          log('CF fallback candidate failed', fallbackIp, error?.message || error);
+          recordCfFailure(locationKey, fallbackIp, error?.message || error);
+          log('CF fallback candidate failed', `colo=${locationKey}`, fallbackIp, error?.message || error);
           fallbackAttempt += 1;
           generation++;
           closeCurrent();
@@ -909,6 +1077,7 @@ function buildConfig(env, request) {
     cfFallbackFirstByteMs: clampInteger(env.CF_FALLBACK_FIRST_BYTE_MS, DEFAULT_CF_FALLBACK_FIRST_BYTE_MS, 250, 3000),
     cfClassifyTimeoutMs: clampInteger(env.CF_CLASSIFY_TIMEOUT_MS, DEFAULT_CF_CLASSIFY_TIMEOUT_MS, 80, 1000),
     cfClassify: !/^(0|false|off|no)$/i.test(String(env.CF_CLASSIFY ?? 'on')),
+    cfExploreEvery: clampInteger(env.CF_EXPLORE_EVERY, DEFAULT_CF_EXPLORE_EVERY, 0, 64),
     cfFallbackIps: parseFallbackPool(env.CF_FALLBACK_IPS).length ? parseFallbackPool(env.CF_FALLBACK_IPS) : CF_FALLBACK_IPS,
     cfFallbackMode: ['auto', 'off', 'force'].includes(String(env.CF_FALLBACK || 'auto').toLowerCase())
       ? String(env.CF_FALLBACK || 'auto').toLowerCase()
@@ -945,9 +1114,13 @@ async function handleVlessWebSocket(request, env, ctx, config, users) {
 
   const log = createLogger(env, request);
   const connector = getConnector(request);
+  const location = requestLocation(request);
   const requestMeta = {
     connectorName: hasRequestFetcher(request) ? 'request.fetcher.connect' : 'cloudflare:sockets',
     supportsCloudflareFallback: hasRequestFetcher(request),
+    colo: location.colo,
+    placement: location.placement,
+    locationKey: location.key,
   };
 
   let headerBuffer = new Uint8Array(0);
@@ -1055,11 +1228,37 @@ export default {
       if (!configuredToken || !constantTimeTextEqual(configuredToken, suppliedToken)) return textResponse('Not found', 404);
       return textResponse(configText(env, request, users, config));
     }
+    if (url.pathname === '/route-stats') {
+      const configuredToken = String(env.CONFIG_TOKEN || '').trim();
+      const suppliedToken = url.searchParams.get('token') || '';
+      if (!configuredToken || !constantTimeTextEqual(configuredToken, suppliedToken)) return textResponse('Not found', 404);
+      const location = requestLocation(request);
+      const ranked = cfPerfSnapshot(location.key, config.cfFallbackIps);
+      return new Response(JSON.stringify({
+        scope: 'current Worker isolate',
+        colo: location.colo,
+        placement: location.placement,
+        locationKey: location.key,
+        exploreEvery: config.cfExploreEvery,
+        routeCacheEntries: ROUTE_CACHE.size,
+        perfEntries: CF_PERF_STATS.size,
+        candidates: ranked,
+      }, null, 2), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      });
+    }
     if (url.pathname === '/health') {
       const healthy = users.length > 0;
       if (url.searchParams.get('detail') === '1') {
         const connectorName = hasRequestFetcher(request) ? 'request.fetcher.connect' : 'cloudflare:sockets';
-        return textResponse(`${healthy ? 'ok' : 'misconfigured'}\nconnector=${connectorName}\ncf_fallback=${config.cfFallbackMode}\ncf_first_byte_ms=${config.cfFirstByteMs}\ncf_fallback_first_byte_ms=${config.cfFallbackFirstByteMs}\ncf_classify=${config.cfClassify ? 'on' : 'off'}\nconnect_race=${config.connectRace}\nws_binary=arraybuffer`, healthy ? 200 : 503);
+        const location = requestLocation(request);
+        const ranked = cfPerfSnapshot(location.key, config.cfFallbackIps);
+        const best = ranked.find((entry) => entry.successes > 0);
+        return textResponse(`${healthy ? 'ok' : 'misconfigured'}\nconnector=${connectorName}\ncolo=${location.colo}\nplacement=${location.placement}\nlocation_key=${location.key}\ncf_fallback=${config.cfFallbackMode}\ncf_first_byte_ms=${config.cfFirstByteMs}\ncf_fallback_first_byte_ms=${config.cfFallbackFirstByteMs}\ncf_classify=${config.cfClassify ? 'on' : 'off'}\ncf_explore_every=${config.cfExploreEvery}\ncf_best_candidate=${best?.ip || '-'}\ncf_best_ewma_ms=${best?.ewmaMs ?? '-'}\nconnect_race=${config.connectRace}\nws_binary=arraybuffer`, healthy ? 200 : 503);
       }
       return textResponse(healthy ? 'ok' : 'misconfigured', healthy ? 200 : 503);
     }
