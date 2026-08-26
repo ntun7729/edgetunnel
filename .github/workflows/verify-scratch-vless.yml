@@ -1,0 +1,63 @@
+name: Verify scratch VLESS worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - worker.js
+      - wrangler.scratch.toml
+      - .github/workflows/verify-scratch-vless.yml
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Syntax check
+        run: node --check worker.js
+      - name: Protocol and bridge tests
+        shell: bash
+        run: |
+          cat > /tmp/test.mjs <<'NODE'
+          import fs from 'node:fs';
+          import vm from 'node:vm';
+          import assert from 'node:assert/strict';
+          let source = fs.readFileSync('worker.js', 'utf8');
+          source = source.replace(/^import \{ connect \} from 'cloudflare:sockets';\n/m, 'const connect=()=>{throw new Error("stub")};\n');
+          source = source.replace('export default {', 'const __default = {');
+          source = source.replace(/\nexport \{[\s\S]*?\n\};\s*$/, '\n');
+          source += '\nglobalThis.__t={parseUuid,parseVlessHeader,concatBytes,appendUdpBuffer,drainUdpDatagrams,handleTcpSession,handleUdpDnsSession};\n';
+          const context={console,TextDecoder,TextEncoder,Uint8Array,ArrayBuffer,URL,Response,Headers,Request,setTimeout,clearTimeout,atob,ReadableStream,WritableStream,AbortController,fetch:async()=>new Response(new Uint8Array([9,9,9]),{status:200})};
+          context.globalThis=context;
+          vm.runInNewContext(source,context,{filename:'worker.js'});
+          const t=context.__t;
+          const user=t.parseUuid('00112233-4455-6677-8899-aabbccddeeff');
+          assert.equal(user.length,16);
+          const payload=new Uint8Array(10*1024).fill(0x5a);
+          const h=new Uint8Array(1+16+1+1+2+1+4+payload.length);
+          let o=0;h[o++]=0;h.set(user,o);o+=16;h[o++]=0;h[o++]=1;h[o++]=1;h[o++]=187;h[o++]=1;h.set([1,1,1,1],o);o+=4;h.set(payload,o);
+          assert.equal(t.parseVlessHeader(h.slice(0,12),[user]).needMore,true);
+          const parsed=t.parseVlessHeader(h,[user]);
+          assert.equal(parsed.host,'1.1.1.1');assert.equal(parsed.port,443);assert.equal(parsed.payload.length,payload.length);
+          const state={buffer:new Uint8Array(0)};t.appendUdpBuffer(state,new Uint8Array([0,3,1]));assert.equal(t.drainUdpDatagrams(state).length,0);t.appendUdpBuffer(state,new Uint8Array([2,3]));assert.deepEqual([...t.drainUdpDatagrams(state)[0]],[1,2,3]);
+          {
+            const writes=[],sent=[];let socketClosed=false,wsClosed=false;
+            const socket={opened:Promise.resolve(),closed:Promise.resolve(),readable:new ReadableStream({start(c){c.enqueue(new Uint8Array([7,8,9]));c.close()}}),writable:new WritableStream({write(c){writes.push([...c])}}),close(){socketClosed=true}};
+            const ws={readyState:1,bufferedAmount:0,send(d){sent.push([...new Uint8Array(d)])},close(){wsClosed=true;this.readyState=3}};
+            const session=await t.handleTcpSession({ws,connector:()=>socket,requestMeta:{connectorName:'mock'},initialPayload:new Uint8Array([1,2,3]),version:0,host:'1.1.1.1',port:443,config:{connectTimeoutMs:1000,idleTimeoutMs:10000},log(){}});
+            await session.done;assert.deepEqual(writes,[[1,2,3]]);assert.deepEqual(sent[0],[0,0]);assert.deepEqual(sent[1],[7,8,9]);assert.equal(socketClosed,true);assert.equal(wsClosed,true);
+          }
+          {
+            const sent=[];const ws={readyState:1,bufferedAmount:0,send(d){sent.push([...new Uint8Array(d)])},close(){this.readyState=3}};
+            const session=await t.handleUdpDnsSession({ws,initialPayload:new Uint8Array([0,3,1,2,3]),version:0,port:53,config:{dohUrl:'https://dns.example/dns-query',connectTimeoutMs:1000,idleTimeoutMs:10000},log(){}});
+            await session.done;assert.deepEqual(sent[0],[0,0]);assert.deepEqual(sent[1],[0,3,9,9,9]);session.closeAll();
+          }
+          console.log('scratch VLESS verification passed');
+          NODE
+          node /tmp/test.mjs
