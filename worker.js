@@ -45,6 +45,11 @@ const CF_PERF_STATS = new Map();
 const CF_ROUTE_USES_MAX = 2048;
 const CF_ROUTE_USES = new Map();
 const DEFAULT_CF_EXPLORE_EVERY = 8;
+const SHARED_PERF_TTL_SECONDS = 1800;
+const SHARED_ROUTE_TTL_SECONDS = 900;
+const CF_HYDRATED_LOCATIONS = new Set();
+const CF_HYDRATE_PROMISES = new Map();
+let SHARED_ROUTING_CACHE_PROMISE = null;
 
 function textResponse(body, status = 200, headers = {}) {
   return new Response(body, {
@@ -350,6 +355,45 @@ function perfKey(locationKey, ip) {
   return `${String(locationKey || 'UNKNOWN')}|${String(ip || '')}`;
 }
 
+function sharedCacheKey(kind, locationKey, id) {
+  const location = encodeURIComponent(String(locationKey || 'UNKNOWN'));
+  const value = encodeURIComponent(String(id || ''));
+  return new Request(`https://scratch-vless-cache.invalid/${kind}/${location}/${value}`);
+}
+
+async function sharedRoutingCache() {
+  if (typeof caches === 'undefined' || typeof caches.open !== 'function') return null;
+  if (!SHARED_ROUTING_CACHE_PROMISE) {
+    SHARED_ROUTING_CACHE_PROMISE = caches.open('scratch-vless-routing-v1').catch(() => null);
+  }
+  return SHARED_ROUTING_CACHE_PROMISE;
+}
+
+async function readSharedJson(kind, locationKey, id) {
+  const cache = await sharedRoutingCache();
+  if (!cache) return null;
+  const response = await cache.match(sharedCacheKey(kind, locationKey, id));
+  if (!response) return null;
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+async function writeSharedJson(kind, locationKey, id, value, ttlSeconds) {
+  const cache = await sharedRoutingCache();
+  if (!cache) return false;
+  const response = new Response(JSON.stringify(value), {
+    headers: {
+      'content-type': 'application/json',
+      'cache-control': `public, max-age=${Math.max(60, Number(ttlSeconds) || 60)}`,
+    },
+  });
+  await cache.put(sharedCacheKey(kind, locationKey, id), response);
+  return true;
+}
+
 function getCfPerf(locationKey, ip) {
   return CF_PERF_STATS.get(perfKey(locationKey, ip)) || null;
 }
@@ -369,6 +413,7 @@ function touchCfPerf(locationKey, ip) {
       lastSuccess: 0,
       lastFailure: 0,
       lastError: '',
+      updatedAt: 0,
     };
     CF_PERF_STATS.set(key, stat);
   } else {
@@ -392,6 +437,7 @@ function recordCfSuccess(locationKey, ip, elapsedMs) {
   stat.lastMs = ms;
   stat.ewmaMs = stat.ewmaMs == null ? ms : (stat.ewmaMs * 0.72) + (ms * 0.28);
   stat.lastSuccess = Date.now();
+  stat.updatedAt = stat.lastSuccess;
   stat.lastError = '';
 }
 
@@ -401,7 +447,72 @@ function recordCfFailure(locationKey, ip, error = '') {
   stat.failures += 1;
   stat.consecutiveFailures += 1;
   stat.lastFailure = Date.now();
+  stat.updatedAt = stat.lastFailure;
   stat.lastError = String(error || '').slice(0, 120);
+}
+
+async function persistCfPerfShared(locationKey, ip) {
+  const stat = getCfPerf(locationKey, ip);
+  if (!stat) return false;
+  return writeSharedJson('perf', locationKey, ip, stat, SHARED_PERF_TTL_SECONDS);
+}
+
+function mergeSharedPerf(locationKey, ip, stored) {
+  if (!stored || stored.ip !== ip) return;
+  const stat = touchCfPerf(locationKey, ip);
+  const localUpdated = Number(stat.updatedAt || 0);
+  const storedUpdated = Number(stored.updatedAt || stored.lastSuccess || stored.lastFailure || 0);
+  if (localUpdated > storedUpdated) return;
+  stat.successes = Math.max(0, Number(stored.successes) || 0);
+  stat.failures = Math.max(0, Number(stored.failures) || 0);
+  stat.consecutiveFailures = Math.max(0, Number(stored.consecutiveFailures) || 0);
+  stat.ewmaMs = stored.ewmaMs == null ? null : Math.max(0, Number(stored.ewmaMs) || 0);
+  stat.lastMs = stored.lastMs == null ? null : Math.max(0, Number(stored.lastMs) || 0);
+  stat.lastSuccess = Math.max(0, Number(stored.lastSuccess) || 0);
+  stat.lastFailure = Math.max(0, Number(stored.lastFailure) || 0);
+  stat.lastError = String(stored.lastError || '').slice(0, 120);
+  stat.updatedAt = storedUpdated;
+}
+
+async function hydrateCfPerfShared(locationKey, pool, log) {
+  const key = String(locationKey || 'UNKNOWN');
+  if (CF_HYDRATED_LOCATIONS.has(key)) return true;
+  if (CF_HYDRATE_PROMISES.has(key)) return CF_HYDRATE_PROMISES.get(key);
+
+  const promise = (async () => {
+    const candidates = [...new Set((pool?.length ? pool : CF_FALLBACK_IPS).filter(Boolean))];
+    try {
+      const rows = await Promise.all(candidates.map(async (ip) => [ip, await readSharedJson('perf', key, ip)]));
+      for (const [ip, stored] of rows) mergeSharedPerf(key, ip, stored);
+      CF_HYDRATED_LOCATIONS.add(key);
+      return true;
+    } catch (error) {
+      log?.('shared CF perf hydrate skipped', error?.message || error);
+      return false;
+    } finally {
+      CF_HYDRATE_PROMISES.delete(key);
+    }
+  })();
+  CF_HYDRATE_PROMISES.set(key, promise);
+  return promise;
+}
+
+async function getSharedRoute(locationKey, host) {
+  const value = await readSharedJson('route', locationKey, String(host || '').toLowerCase());
+  if (!value || !['cf', 'direct', 'cf-hint', 'not-cf'].includes(value.route)) return null;
+  return {
+    route: value.route,
+    candidateIp: String(value.candidateIp || ''),
+  };
+}
+
+async function persistSharedRoute(locationKey, host, route, candidateIp = '') {
+  const ttl = route === 'cf' ? SHARED_ROUTE_TTL_SECONDS : Math.min(SHARED_ROUTE_TTL_SECONDS, 300);
+  return writeSharedJson('route', locationKey, String(host || '').toLowerCase(), {
+    route,
+    candidateIp: candidateIp || '',
+    updatedAt: Date.now(),
+  }, ttl);
 }
 
 function cfCandidateScore(stat) {
@@ -677,8 +788,21 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
 
   const canCfFallback = requestMeta.supportsCloudflareFallback && port === 443 && config.cfFallbackMode !== 'off';
   const forceCfFallback = canCfFallback && config.cfFallbackMode === 'force';
-  const cachedRoute = getCachedRoute(host);
   const locationKey = requestMeta.locationKey || requestMeta.colo || 'UNKNOWN';
+  if (canCfFallback) await hydrateCfPerfShared(locationKey, config.cfFallbackIps, log);
+  let cachedRoute = getCachedRoute(host);
+  if (canCfFallback && !cachedRoute) {
+    try {
+      const sharedRoute = await getSharedRoute(locationKey, host);
+      if (sharedRoute) {
+        cacheRoute(host, sharedRoute.route, sharedRoute.candidateIp);
+        cachedRoute = getCachedRoute(host);
+        log('shared route hit', `colo=${locationKey}`, host, sharedRoute.route, sharedRoute.candidateIp || '-');
+      }
+    } catch (error) {
+      log('shared route lookup skipped', error?.message || error);
+    }
+  }
   const immediateCfHint = canCfFallback && (
     forceCfFallback ||
     cachedRoute?.route === 'cf' ||
@@ -765,9 +889,13 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
     if (isFallback && candidateIp) {
       const elapsedMs = activeFallbackStartMs ? Math.max(0, performance.now() - activeFallbackStartMs) : 0;
       recordCfSuccess(locationKey, candidateIp, elapsedMs);
+      requestMeta.defer?.(persistCfPerfShared(locationKey, candidateIp).catch((error) => log('shared perf write skipped', error?.message || error)));
       log('CF candidate success', `colo=${locationKey}`, candidateIp, `${Math.round(elapsedMs)}ms`);
     }
-    cacheRoute(host, isFallback ? 'cf' : 'direct', isFallback ? candidateIp : '');
+    const learnedRoute = isFallback ? 'cf' : 'direct';
+    const learnedCandidate = isFallback ? candidateIp : '';
+    cacheRoute(host, learnedRoute, learnedCandidate);
+    requestMeta.defer?.(persistSharedRoute(locationKey, host, learnedRoute, learnedCandidate).catch((error) => log('shared route write skipped', error?.message || error)));
     replay.length = 0;
     replayBytes = 0;
     return true;
@@ -845,6 +973,7 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
     }
     if (advance && activeFallbackIp) {
       recordCfFailure(locationKey, activeFallbackIp, reason);
+      requestMeta.defer?.(persistCfPerfShared(locationKey, activeFallbackIp).catch((error) => log('shared perf write skipped', error?.message || error)));
       log('CF candidate failure', `colo=${locationKey}`, activeFallbackIp, reason);
     }
     if (!fallbackAttempted) {
@@ -875,6 +1004,7 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
         } catch (error) {
           lastError = error;
           recordCfFailure(locationKey, fallbackIp, error?.message || error);
+          requestMeta.defer?.(persistCfPerfShared(locationKey, fallbackIp).catch((writeError) => log('shared perf write skipped', writeError?.message || writeError)));
           log('CF fallback candidate failed', `colo=${locationKey}`, fallbackIp, error?.message || error);
           fallbackAttempt += 1;
           generation++;
@@ -1121,6 +1251,13 @@ async function handleVlessWebSocket(request, env, ctx, config, users) {
     colo: location.colo,
     placement: location.placement,
     locationKey: location.key,
+    defer: (promise) => {
+      if (!promise) return;
+      try {
+        if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(promise);
+        else Promise.resolve(promise).catch(() => {});
+      } catch {}
+    },
   };
 
   let headerBuffer = new Uint8Array(0);
@@ -1233,15 +1370,17 @@ export default {
       const suppliedToken = url.searchParams.get('token') || '';
       if (!configuredToken || !constantTimeTextEqual(configuredToken, suppliedToken)) return textResponse('Not found', 404);
       const location = requestLocation(request);
+      await hydrateCfPerfShared(location.key, config.cfFallbackIps);
       const ranked = cfPerfSnapshot(location.key, config.cfFallbackIps);
       return new Response(JSON.stringify({
-        scope: 'current Worker isolate',
+        scope: 'colo-local Cache API + current isolate hot cache',
         colo: location.colo,
         placement: location.placement,
         locationKey: location.key,
         exploreEvery: config.cfExploreEvery,
-        routeCacheEntries: ROUTE_CACHE.size,
-        perfEntries: CF_PERF_STATS.size,
+        sharedCache: typeof caches !== 'undefined' && typeof caches.open === 'function' ? 'enabled' : 'unavailable',
+        routeCacheEntriesCurrentIsolate: ROUTE_CACHE.size,
+        perfEntriesCurrentIsolate: CF_PERF_STATS.size,
         candidates: ranked,
       }, null, 2), {
         status: 200,
@@ -1256,9 +1395,10 @@ export default {
       if (url.searchParams.get('detail') === '1') {
         const connectorName = hasRequestFetcher(request) ? 'request.fetcher.connect' : 'cloudflare:sockets';
         const location = requestLocation(request);
+        await hydrateCfPerfShared(location.key, config.cfFallbackIps);
         const ranked = cfPerfSnapshot(location.key, config.cfFallbackIps);
         const best = ranked.find((entry) => entry.successes > 0);
-        return textResponse(`${healthy ? 'ok' : 'misconfigured'}\nconnector=${connectorName}\ncolo=${location.colo}\nplacement=${location.placement}\nlocation_key=${location.key}\ncf_fallback=${config.cfFallbackMode}\ncf_first_byte_ms=${config.cfFirstByteMs}\ncf_fallback_first_byte_ms=${config.cfFallbackFirstByteMs}\ncf_classify=${config.cfClassify ? 'on' : 'off'}\ncf_explore_every=${config.cfExploreEvery}\ncf_best_candidate=${best?.ip || '-'}\ncf_best_ewma_ms=${best?.ewmaMs ?? '-'}\nconnect_race=${config.connectRace}\nws_binary=arraybuffer`, healthy ? 200 : 503);
+        return textResponse(`${healthy ? 'ok' : 'misconfigured'}\nconnector=${connectorName}\ncolo=${location.colo}\nplacement=${location.placement}\nlocation_key=${location.key}\ncf_fallback=${config.cfFallbackMode}\ncf_first_byte_ms=${config.cfFirstByteMs}\ncf_fallback_first_byte_ms=${config.cfFallbackFirstByteMs}\ncf_classify=${config.cfClassify ? 'on' : 'off'}\ncf_explore_every=${config.cfExploreEvery}\ncf_best_candidate=${best?.ip || '-'}\ncf_best_ewma_ms=${best?.ewmaMs ?? '-'}\nlearning_scope=colo-local-cache\nconnect_race=${config.connectRace}\nws_binary=arraybuffer`, healthy ? 200 : 503);
       }
       return textResponse(healthy ? 'ok' : 'misconfigured', healthy ? 200 : 503);
     }
