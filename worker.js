@@ -13,7 +13,11 @@ const MAX_VLESS_HEADER_BYTES = 4096;
 const MAX_UDP_DATAGRAM_BYTES = 65535;
 const MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024;
 const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
-const CF_FALLBACK_IPS = ['104.16.0.1', '104.17.0.1', '104.18.0.1'];
+const CF_FALLBACK_IPS = [
+  '172.71.218.190', '162.158.228.87', '162.158.189.134', '162.158.26.63',
+  '162.158.25.86', '162.158.29.216', '162.158.218.160', '162.158.227.214',
+  '172.69.118.198', '172.69.119.150',
+];
 const DEFAULT_CF_FIRST_BYTE_MS = 1200;
 const MAX_REPLAY_BYTES = 1024 * 1024;
 
@@ -309,6 +313,7 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
   let firstByteSeen = false;
   let firstByteTimer = null;
   let fallbackAttempted = false;
+  let fallbackAttempt = -1;
   let switching = false;
   let switchPromise = Promise.resolve();
   let uplink = Promise.resolve();
@@ -330,6 +335,19 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
   const clearFirstByteTimer = () => {
     if (firstByteTimer) clearTimeout(firstByteTimer);
     firstByteTimer = null;
+  };
+
+  const armFirstByteTimer = (isFallback) => {
+    clearFirstByteTimer();
+    if (!canCfFallback || firstByteSeen || closed) return;
+    firstByteTimer = setTimeout(() => {
+      if (closed || firstByteSeen) return;
+      if (isFallback) {
+        triggerCfFallback(`${config.cfFirstByteMs}ms without first byte on CF fallback`, true).catch(() => {});
+      } else if (!fallbackAttempted) {
+        triggerCfFallback(`${config.cfFirstByteMs}ms without first byte`, false).catch(() => {});
+      }
+    }, config.cfFirstByteMs);
   };
 
   const closeCurrent = () => {
@@ -378,16 +396,16 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
       try {
         while (!closed && myGeneration === generation) {
           const { value, done: streamDone } = await myReader.read();
+          if (myGeneration !== generation || closed) return;
           if (streamDone) {
-            if (!firstByteSeen && !isFallback && canCfFallback) {
-              await triggerCfFallback('direct EOF before first byte');
-            } else if (myGeneration === generation) {
+            if (!firstByteSeen && canCfFallback) {
+              await triggerCfFallback(isFallback ? 'CF fallback EOF before first byte' : 'direct EOF before first byte', isFallback);
+            } else {
               closeAll(1000, 'remote closed');
             }
             return;
           }
           if (!value?.byteLength) continue;
-          if (myGeneration !== generation || closed) return;
           markFirstByte();
           idle.arm();
           await waitForWsBackpressure(ws);
@@ -395,9 +413,9 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
         }
       } catch (error) {
         if (closed || myGeneration !== generation) return;
-        if (!firstByteSeen && !isFallback && canCfFallback) {
+        if (!firstByteSeen && canCfFallback) {
           try {
-            await triggerCfFallback(`direct read failed: ${error?.message || error}`);
+            await triggerCfFallback(`${isFallback ? 'CF fallback' : 'direct'} read failed: ${error?.message || error}`, isFallback);
             return;
           } catch {}
         }
@@ -409,9 +427,9 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
     })();
   };
 
-  const openTarget = async (targetHost, label, isFallback) => {
+  const openTarget = async (targetHost, label, isFallback, timeoutMs = config.connectTimeoutMs) => {
     const myGeneration = ++generation;
-    const newSocket = await connectWithTimeout(connector, targetHost, port, config.connectTimeoutMs);
+    const newSocket = await connectWithTimeout(connector, targetHost, port, timeoutMs);
     if (closed || myGeneration !== generation) {
       try { newSocket.close(); } catch {}
       throw new Error('connection superseded');
@@ -419,6 +437,7 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
     socket = newSocket;
     writer = socket.writable.getWriter();
     reader = socket.readable.getReader();
+    replayedThroughId = -1;
     log('TCP connected', `${host}:${port}`, requestMeta.connectorName, label, targetHost);
     startDownlink(myGeneration, isFallback);
   };
@@ -427,33 +446,54 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
     let i = 0;
     while (!closed && i < replay.length) {
       const item = replay[i++];
+      if (item.id <= replayedThroughId) continue;
       await writer.write(item.bytes);
-      replayedThroughId = Math.max(replayedThroughId, item.id);
+      replayedThroughId = item.id;
     }
   };
 
-  async function triggerCfFallback(reason) {
-    if (!canCfFallback || fallbackAttempted || firstByteSeen || closed) {
+  async function triggerCfFallback(reason, advance = false) {
+    if (!canCfFallback || firstByteSeen || closed) {
       throw new Error('Cloudflare fallback unavailable');
     }
-    fallbackAttempted = true;
+    if (!fallbackAttempted) {
+      fallbackAttempted = true;
+      fallbackAttempt = 0;
+    } else if (advance) {
+      fallbackAttempt += 1;
+    }
+
     switching = true;
     clearFirstByteTimer();
     generation++;
     closeCurrent();
-    const fallbackIp = selectCfFallback(host, 0);
-    log('CF fallback', reason, `${host}:${port}`, 'via', fallbackIp);
+
     switchPromise = (async () => {
-      await openTarget(fallbackIp, 'cf-anycast', true);
-      await writeReplay();
+      let lastError = null;
+      const fallbackConnectMs = Math.max(500, Math.min(config.connectTimeoutMs, config.cfFirstByteMs));
+      while (!closed && !firstByteSeen && fallbackAttempt < CF_FALLBACK_IPS.length) {
+        const fallbackIp = selectCfFallback(host, fallbackAttempt);
+        log('CF fallback', reason, `${host}:${port}`, `candidate=${fallbackAttempt + 1}/${CF_FALLBACK_IPS.length}`, 'via', fallbackIp);
+        try {
+          await openTarget(fallbackIp, 'cf-anycast', true, fallbackConnectMs);
+          await writeReplay();
+          switching = false;
+          idle.arm();
+          armFirstByteTimer(true);
+          return;
+        } catch (error) {
+          lastError = error;
+          log('CF fallback candidate failed', fallbackIp, error?.message || error);
+          fallbackAttempt += 1;
+          generation++;
+          closeCurrent();
+        }
+      }
       switching = false;
-      idle.arm();
-    })().catch((error) => {
-      switching = false;
-      log('CF fallback failed', error?.message || error);
+      const message = lastError?.message || 'all Cloudflare fallback candidates exhausted';
       closeAll(1011, 'Cloudflare fallback failed');
-      throw error;
-    });
+      throw new Error(message);
+    })();
     return switchPromise;
   }
 
@@ -486,15 +526,13 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
 
   try {
     if (forceCfFallback) {
-      fallbackAttempted = true;
-      await openTarget(selectCfFallback(host, 0), 'cf-anycast-force', true);
+      await triggerCfFallback('forced CF fallback', false);
     } else {
       try {
         await openTarget(host, 'direct', false);
       } catch (error) {
         if (!canCfFallback) throw error;
-        fallbackAttempted = false;
-        await triggerCfFallback(`direct connect failed: ${error?.message || error}`);
+        await triggerCfFallback(`direct connect failed: ${error?.message || error}`, false);
       }
     }
 
@@ -503,12 +541,8 @@ async function handleTcpSession({ ws, connector, requestMeta, initialPayload, ve
     if (!switching && writer && replay.length) await writeReplay();
     else if (switching) await switchPromise;
 
-    if (!firstByteSeen && canCfFallback && !forceCfFallback && !fallbackAttempted) {
-      firstByteTimer = setTimeout(() => {
-        if (!closed && !firstByteSeen && !fallbackAttempted) {
-          triggerCfFallback(`${config.cfFirstByteMs}ms without first byte`).catch(() => {});
-        }
-      }, config.cfFirstByteMs);
+    if (!firstByteSeen && canCfFallback) {
+      armFirstByteTimer(fallbackAttempted);
     }
   } catch (error) {
     closeAll(1011, error?.message || 'TCP connect failed');
