@@ -1,6 +1,7 @@
 name = "scratch-vless"
 main = "worker.js"
 compatibility_date = "2026-08-26"
+compatibility_flags = ["no_web_socket_compression"]
 keep_vars = true
 
 [vars]
